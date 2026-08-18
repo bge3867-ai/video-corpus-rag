@@ -1,0 +1,7 @@
+# vLLM 推理服务环境 (独立 conda 环境, python 3.11)
+# torch 与 vllm 版本必须匹配本机 CUDA, 以 CUDA 12.8 为例:
+#   conda create -n vllm python=3.11 -y && conda activate vllm
+#   pip install torch==2.9.0 --index-url https://download.pytorch.org/whl/cu128
+#   pip install -r requirements-vllm.txt
+vllm==0.11.2
+openai

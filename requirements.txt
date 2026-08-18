@@ -1,0 +1,16 @@
+# 应用环境 (videosrag) 依赖; torch 需按本机 CUDA 版本单独安装, 见 setup.sh
+transformers>=4.57,<5
+qwen-vl-utils>=0.0.14
+accelerate
+einops
+av
+pillow
+pyyaml
+chromadb
+fastapi
+uvicorn[standard]
+python-multipart
+openai
+faster-whisper
+huggingface_hub
+numpy

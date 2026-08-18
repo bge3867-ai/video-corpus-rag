@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>视频库语义检索问答</title>
+<style>
+  body { margin:0; font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+         background:#0f1218; color:#e6e9ef; }
+  header { padding:18px 24px; border-bottom:1px solid #232a38; }
+  header h1 { margin:0; font-size:20px; }
+  header p { margin:4px 0 0; color:#8b93a5; font-size:13px; }
+  .wrap { max-width:860px; margin:0 auto; padding:24px 16px 80px; }
+  .search { display:flex; gap:10px; }
+  input[type=text] { flex:1; padding:12px 14px; font-size:15px; border-radius:10px;
+    border:1px solid #2b3446; background:#151a24; color:#e6e9ef; outline:none; }
+  input[type=text]:focus { border-color:#4f7cf7; }
+  button { padding:12px 22px; font-size:15px; border:0; border-radius:10px;
+    background:#4f7cf7; color:#fff; cursor:pointer; }
+  button:disabled { background:#33415e; cursor:wait; }
+  .row { display:flex; align-items:center; gap:10px; margin-top:12px; color:#8b93a5; font-size:13px; }
+  .answer { margin-top:20px; background:#151a24; border:1px solid #232a38;
+    border-radius:12px; padding:16px 20px; line-height:1.7; white-space:pre-wrap; }
+  .answer .h { color:#4f7cf7; font-weight:600; margin-bottom:8px; }
+  .clips { margin-top:20px; display:grid; gap:16px; }
+  .clip { background:#151a24; border:1px solid #232a38; border-radius:12px; overflow:hidden; }
+  .clip video { width:100%; max-height:340px; background:#000; display:block; }
+  .clip .meta { padding:10px 14px; font-size:13px; color:#8b93a5; }
+  .clip .meta b { color:#e6e9ef; }
+  .clip .summ { margin-top:6px; color:#c9d2e3; line-height:1.6; }
+  .clip .summ::before { content:"📝 语义摘要: "; color:#4f7cf7; font-weight:600; }
+  .clip .cap { margin-top:6px; color:#c9d2e3; line-height:1.6; }
+  .clip .cap::before { content:"🎬 结构化描述: "; color:#4f7cf7; font-weight:600; }
+  .clip .cap b { color:#8fa8f5; font-weight:600; }
+  .clip .ocr { margin-top:6px; color:#c9d2e3; line-height:1.6; }
+  .clip .ocr::before { content:"🔤 画面文字: "; color:#4f7cf7; font-weight:600; }
+  .clip .asr { margin-top:6px; color:#c9d2e3; line-height:1.6; }
+  .clip .asr::before { content:"🔊 语音文本: "; color:#4f7cf7; font-weight:600; }
+  .err { color:#ff7a7a; margin-top:12px; }
+  a { color:#7ba1ff; text-decoration:none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🎬 视频库语义检索问答</h1>
+  <p>用自然语言提问, 系统在<b>整个视频库</b>里检索最相关的片段并返回给你, 同时给出基于片段的回答</p>
+</header>
+<div class="wrap">
+  <div class="search">
+    <input id="q" type="text" placeholder="问视频库里的内容, 例如: 有没有森林着火的画面?" />
+    <button id="btn" onclick="ask()">提问</button>
+  </div>
+  <div class="row">
+    <label>返回片段数</label>
+    <select id="k">
+      <option>2</option><option selected>4</option><option>6</option><option>8</option>
+    </select>
+    <span id="stat" style="margin-left:auto"></span>
+  </div>
+  <div class="row">
+    <label>上传视频入库</label>
+    <input type="file" id="file" accept="video/*" style="flex:1; padding:6px 8px; font-size:13px;
+      border:1px solid #2b3446; background:#151a24; color:#e6e9ef; border-radius:8px;">
+    <button id="upbtn" onclick="upload()" style="padding:7px 16px; font-size:13px;">上传并入库</button>
+    <span id="upstat"></span>
+  </div>
+  <div id="err" class="err"></div>
+  <div id="answer" class="answer" style="display:none">
+    <div class="h">💬 基于命中片段的回答</div>
+    <div id="answerText"></div>
+  </div>
+  <div id="clips" class="clips"></div>
+</div>
+<script>
+function refreshStat(){
+  fetch('/health').then(r=>r.json()).then(d=>{
+    document.getElementById('stat').textContent = '已入库片段: ' + d.clips_in_index;
+  });
+}
+refreshStat();
+async function upload(){
+  const f = document.getElementById('file').files[0];
+  const st = document.getElementById('upstat');
+  if(!f){ st.textContent='请先选择视频文件'; return; }
+  const btn = document.getElementById('upbtn');
+  btn.disabled = true; st.textContent='上传中...';
+  try{
+    const fd = new FormData(); fd.append('file', f);
+    const r = await fetch('/upload', {method:'POST', body:fd});
+    const d = await r.json();
+    if(d.error){ st.textContent='错误: '+d.error; return; }
+    st.textContent = '已上传, 正在入库 (任务#'+d.job_id+')...';
+    pollJob(d.job_id);
+  }catch(e){ st.textContent='上传失败: '+e; }
+  finally{ btn.disabled=false; }
+}
+function pollJob(id){
+  const st = document.getElementById('upstat');
+  const timer = setInterval(async()=>{
+    try{
+      const r = await fetch('/jobs/'+id);
+      const d = await r.json();
+      if(d.error){ clearInterval(timer); return; }
+      if(d.status.includes('中')){ st.textContent='任务#'+id+': '+d.status; return; }
+      clearInterval(timer);
+      st.textContent = '任务#'+id+': '+d.status + (d.clips!=null ? ' ('+d.clips+' 个片段)' : '') + (d.error? ' '+d.error : '');
+      refreshStat();
+    }catch(e){ /* 轮询失败忽略, 下轮再试 */ }
+  }, 3000);
+}
+function ask(){
+  const q = document.getElementById('q').value.trim();
+  const err = document.getElementById('err');
+  err.textContent='';
+  if(!q){ err.textContent='请输入问题'; return; }
+  const btn = document.getElementById('btn');
+  btn.disabled = true; btn.textContent = '检索中...';
+  fetch('/ask', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({question:q, top_k:+document.getElementById('k').value})})
+  .then(r=>r.json()).then(d=>{
+    if(d.error){ err.textContent=d.error; return; }
+    const a = document.getElementById('answer');
+    if(d.answer){ a.style.display='block'; document.getElementById('answerText').textContent=d.answer; }
+    else { a.style.display='none'; }
+    const box = document.getElementById('clips');
+    box.innerHTML = d.clips.map((c,i)=>`
+      <div class="clip">
+        <video controls preload="metadata" src="${c.clip_url}"></video>
+        <div class="meta"><b>片段${i+1}</b> · 视频 <b>${c.video}</b> ·
+        切片 ${c.start}s ~ ${c.end}s${c.video_duration ? ` · 原视频全片 ${c.video_duration}s` : ''} ·
+        相似度 ${(1-(c.distance??0)).toFixed(3)} · <a href="${c.clip_url}" download>下载</a>
+        ${c.summary ? `<div class="summ">${c.summary}</div>` : ''}
+        ${(c.objects||c.actions||c.scene) ? `<div class="cap">${[['对象',c.objects],['动作',c.actions],['场景',c.scene]].filter(x=>x[1]).map(x=>`<b>${x[0]}</b>: ${x[1]}`).join(' · ')}</div>` : ''}
+        ${c.ocr ? `<div class="ocr">${c.ocr}</div>` : ''}
+        ${c.asr ? `<div class="asr">${c.asr}</div>` : ''}
+        </div>
+      </div>`).join('');
+  }).catch(e=>err.textContent='请求失败: '+e)
+  .finally(()=>{ btn.disabled=false; btn.textContent='提问'; });
+}
+document.getElementById('q').addEventListener('keydown', e=>{ if(e.key==='Enter') ask(); });
+</script>
+</body>
+</html>

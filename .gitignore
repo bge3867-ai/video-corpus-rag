@@ -1,0 +1,16 @@
+# 数据目录 (视频/切片/向量库/模型/日志) 不入库, 由用户本地生成
+videos/
+clips/
+chroma_db/
+models/
+logs/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+env/
+
+# 系统
+.DS_Store
