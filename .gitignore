@@ -14,3 +14,7 @@ env/
 
 # 系统
 .DS_Store
+
+# 本机维护工具 (含服务器地址, 不上传)
+sync_from_deploy.sh
+维护更新说明.md
