@@ -1,190 +1,259 @@
-# 🎬 Video Corpus RAG — 视频库级语义检索问答
+# Video Corpus RAG: A Multimodal Video Retrieval-Augmented Generation Framework for Long Video Understanding
 
-用自然语言向**整个视频库**提问, 系统跨全部视频检索语义最相关的片段, **切出真实视频切片**返回, 并基于切片内容作答。
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-green.svg)](https://www.python.org/)
+[![CUDA](https://img.shields.io/badge/CUDA-12.4%2B-76b900.svg)](https://developer.nvidia.com/cuda-toolkit)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
-完全基于开源组件构建 (替代 TwelveLabs + Chroma 的闭源方案):
+**Video Corpus RAG** is a fully open-source, multimodal Video RAG framework that lets you ask natural-language questions against an *entire video corpus* and receive answers grounded in the actual video clips — retrieved, cut, and cited.
 
-- **视频切片** (6s) → **Qwen3-VL-Embedding-8B** 打向量 → **Chroma** 全库统一索引
-- 入库时对每个片段自动做**文本侧三重增强**:
-  - 📝 一句话中文**语义摘要**
-  - 🎬 **结构化描述** (对象/动作/场景) —— 行为类提问「男人在走」「动物奔跑」直接命中
-  - 🔤 **画面文字 OCR** —— 车牌/路牌/横幅可检索
-  - 🔊 **语音转写 ASR** (faster-whisper) —— 「谁说了什么」可检索
-- **提问** → 跨全库**混合检索** (视频向量 + 文本向量 RRF 融合) → 切出 top-k 片段 → **Qwen3-VL-8B-Instruct** 基于片段作答 (标注来源)
-- 问答推理走 **vLLM 推理服务** (OpenAI 兼容接口, 独立进程, 秒级响应、支持并发), 可一键回退进程内 transformers
+Ask *"What happened before the person opened the door?"* across thousands of hours of video, and the system finds the semantically relevant moments, extracts the exact few-second clips, and answers with evidence annotations.
 
-所有模型均 Apache-2.0 开源。Web 界面自带: 提问 / 上传视频自动入库 / 片段播放与下载 / 摘要、结构化描述、语音文本展示。
+Built entirely from open-source components (an open alternative to TwelveLabs + Chroma stacks):
 
-## 架构
+- **Video RAG** — semantic retrieval over a whole video library, not a single video
+- **Multimodal Retrieval** — video embeddings + text embeddings fused with Reciprocal Rank Fusion (RRF)
+- **VLM Reasoning** — Qwen3-VL-8B-Instruct answers directly over the retrieved clips
+- **ASR/OCR Fusion** — speech transcripts and on-screen text are indexed and retrievable
+- **Action-level Retrieval** — structured captions (objects / actions / scene) make verb queries like *"a man running"* hit precisely
+- **vLLM Acceleration** — 3–5 s per query on a single GPU, with concurrent inference
+
+All models are Apache-2.0 licensed.
+
+## ✨ Features
+
+- **Long video semantic retrieval** — 6-second clips (with overlap) embedded by Qwen3-VL-Embedding-8B, indexed in Chroma with cosine similarity
+- **Action-level temporal retrieval** — every clip is automatically captioned into objects / actions / scene, so behavior-oriented queries (*"walking"*, *"cooking"*, *"running away"*) match directly
+- **Multimodal evidence aggregation** — video vectors + summary/caption/ASR text vectors, fused per-clip with weighted RRF
+- **ASR and OCR integration** — faster-whisper transcripts ("who said what") and on-screen text (signs, banners, license plates) are searchable
+- **Vision-language model reasoning** — answers are generated only from the retrieved clips, with `[Clip N]` provenance annotations
+- **Efficient inference with vLLM** — OpenAI-compatible inference service with graceful fallback to in-process transformers
+- **Query rewriting & multi-turn conversation** — queries are expanded into synonymous phrases; follow-up questions carry conversation history
+- **Precision reranking** — optional Qwen3-Reranker-8B re-scoring of candidates
+- **Adaptive scene slicing** — optional PySceneDetect shot-boundary segmentation instead of fixed windows
+- **Batteries-included web UI** — upload, chat, timeline hit visualization, in-browser voice input, clip playback/download
+
+## 🏗️ Architecture
 
 ```
-                 ┌──────────────────────── 入库管道 (离线) ────────────────────────┐
-   videos/ ─────►│  切片(6s) → 抽帧 → Qwen3-VL-Embedding-8B → Chroma 视频向量    │
-                 │       └─► VLM 摘要+结构化描述(含OCR) → 文本向量  ─┐             │
-                 │       └─► faster-whisper ASR → 文本向量        ───┴─► videosrag │
-                 └─────────────────────────────────────────────────────────────────┘
-                                            │
-   提问 ──► Qwen3-VL-Embedding-8B 查询向量 ─┴─► 视频路 + 文本路 RRF 混合检索
-                                            │
-                    命中 top-k 片段 ◄────────┘
-                          │
-                          ▼
-              Qwen3-VL-8B-Instruct (vLLM 服务, 8900)
-                          │
-        ┌─────────────────┴──────────────────┐
-        ▼                                    ▼
-   自然语言答案 (标注 [片段N])         切片 mp4 + 起止秒数 + 文本增强字段
+Video Input ──► Video Processing ──► Multimodal Indexing ──► Retrieval ──► VLM Reasoning ──► Answer Generation
+   │                  │                      │                   │               │                   │
+  videos/         6s sliding        Qwen3-VL-Embedding-8B    video path    Qwen3-VL-8B-Instruct    answer with
+ (mp4/avi/mov)    window clips        + Chroma (cosine)     + text path    (vLLM service)        [Clip N] citations
+                  (1.5s overlap)          │                   RRF fusion         │                   │
+                       │                  │                       │               │              clip mp4s
+                  VLM caption        text vectors             per-clip       optional 32B       + start/end times
+                  (objects/actions/  (summary/caption/asr)    grouping       bnb-4bit mode      + caption/OCR/ASR
+                  scene/OCR)              │                     top-k             │
+                  ASR (whisper) ──────────┘                     merge           top-k clips
+                                                                  │             sampled frames
+                                                           query rewrite        as images
+                                                           (synonym phrases)
 ```
 
-GPU 分配 (按 config.yaml 调整): `cuda0`=embedding, `cuda1`=vLLM 问答, `cuda2`=ASR。
+**Offline indexing pipeline** (once per video): slice → sample frames → embed video clip → generate structured caption (one VLM call) → transcribe audio → store 1 video vector + up to 3 text vectors per clip in Chroma.
 
-## 功能特性
+**Online query pipeline**: question → query rewrite (synonym expansion) → hybrid retrieval (video + text, RRF) → adjacent-clip merging → optional reranking → VLM reasoning over top-k clips → cited answer + playable clip files.
 
-- **语料库级检索**: 一次提问扫描全部视频的所有片段, 不是单视频内检索
-- **混合检索**: 视频向量 + 摘要/结构化描述/语音 三类文本向量, RRF 融合, 各路权重可调
-- **行为级检索**: 结构化描述把对象/动作/场景拆开入库, 「奔跑」「炒菜」这类动词查询精准命中
-- **网页上传即入库**: 上传视频 → 自动切片/向量化/三重增强, 全程无需命令行
-- **vLLM 加速**: 问答与摘要走独立 vLLM 推理服务, 单次问答约 3~5 秒, 支持 8 路并发
-- **显存自适应**: 图片本地缩放控制 token 数, 按 top_k 自动调整每片段帧数, 8×3090 实测稳定
+GPU layout used in our testbed (adjust in `config.yaml`): `cuda0` = embedding, `cuda1` = vLLM Q&A, `cuda2` = ASR, `cuda3` = reranker.
 
-## 安装
+## 🚀 Quick Start
 
-### 1. 应用环境 (切片/向量化/检索服务)
+### 1. Installation
 
 ```bash
-bash setup.sh            # 创建 conda 环境 videosrag + 安装依赖 (含 CUDA 版 PyTorch)
+git clone https://github.com/bge3867-ai/video-corpus-rag.git
+cd video-corpus-rag
+bash setup.sh            # creates conda env `videosrag` + installs deps (incl. CUDA PyTorch)
 ```
 
-要求: Linux + NVIDIA GPU (建议 ≥24GB 显存), CUDA ≥ 12.4, conda。
+Requirements: Linux, NVIDIA GPU (≥ 24 GB VRAM recommended), CUDA ≥ 12.4, conda.
 
-### 2. vLLM 推理服务环境 (可选, 但强烈推荐)
+### 2. Environment setup
 
 ```bash
+# vLLM inference service (optional, strongly recommended — 3-5 s answers)
 conda create -n vllm python=3.11 -y && conda activate vllm
-# torch 与 vllm 版本需匹配本机 CUDA (下例为 CUDA 12.8; 其他版本见 vLLM 官方文档)
-pip install torch==2.9.0 --index-url https://download.pytorch.org/whl/cu128
+pip install torch==2.9.0 --index-url https://download.pytorch.org/whl/cu128   # match your CUDA
 pip install -r requirements-vllm.txt
+
+# Download models (~35 GB, ModelScope first with HF fallback, resumable)
+bash download_models.sh
 ```
 
-> ⚠️ **vLLM 部署注意事项** (实测踩坑, 按需处理):
-> 1. vllm 0.11.2 + 驱动 570 (CUDA 12.8) 组合可用; 若报 CUDA 版本不符, 请对齐 torch/vllm 的 cuXXX 版本
-> 2. 若启动时报 "No available memory for cache blocks" / KV 缓存异常: 把
->    `models/Qwen3-VL-8B-Instruct/preprocessor_config.json` 的 `longest_edge`
->    从 `16777216` 改为 `245760`
-> 3. 若视频输入 token 膨胀: 本项目问答路径已改为**本地抽帧送图片** (见 `src/enrich.py: frame_parts`),
->    不走 vLLM 视频模态, 无需额外处理
-> 4. 若 `qwen_vl_utils` 报 `video_fps` 相关错误, 见 `src/common.py` 说明
-
-### 3. 下载模型 (~35GB)
+### 3. Demo
 
 ```bash
-bash download_models.sh   # ModelScope 优先, 失败自动回退 hf-mirror, 断点续传
+# drop your videos into videos/
+bash run_index.sh        # ① index the corpus (idempotent, incremental)
+bash run_vllm.sh         # ② start the vLLM inference service (optional)
+bash run_server.sh       # ③ start the app server
 ```
 
-## 快速开始
+Open **http://localhost:8899** in your browser, or query via HTTP:
 
 ```bash
-# 1. 把你的视频放进 videos/ (mp4/avi/mov/mkv/webm/flv)
-# 2. 建索引 (幂等, 新视频自动增量)
-bash run_index.sh
-# 3. 启动 vLLM 服务 (可选; 不启动则走进程内 transformers 兜底)
-bash run_vllm.sh
-# 4. 启动应用服务
-bash run_server.sh
-```
-
-浏览器打开 **http://localhost:8899** 即可提问、上传视频。
-
-不想用 vLLM 时, 把 `config.yaml` 里 `vllm.enabled` 改为 `false` 重启服务即可 (慢但零额外部署)。
-
-## HTTP API
-
-```bash
-# 提问 (跨全库检索 + 基于命中片段作答)
 curl -X POST http://localhost:8899/ask \
   -H 'Content-Type: application/json' \
-  -d '{"question": "有没有森林着火的画面?", "top_k": 4}'
-
-# 上传视频自动入库
-curl -F "file=@myvideo.mp4" http://localhost:8899/upload   # 返回 job_id
-curl http://localhost:8899/jobs/1                          # 查询入库进度
-
-# 服务状态
-curl http://localhost:8899/health
+  -d '{"question": "What happened before the person opened the door?", "top_k": 4}'
 ```
 
-`/ask` 返回:
+That's it — from clone to first answer in about 5 minutes (plus model download time). No vLLM? Set `vllm.enabled: false` in `config.yaml` and the server falls back to in-process transformers (slower, zero extra setup).
 
+## 📖 Example
+
+**Question:**
+> "What happened before the person opened the door?"
+
+**Retrieved Evidence:**
 ```json
 {
-  "question": "有没有森林着火的画面?",
-  "answer": "片段1 展示了森林燃烧的场景 [片段1] ...",
   "clips": [
     {
-      "id": "abc123", "video": "forestfire_3",
-      "start": 0.0, "end": 6.0, "video_duration": 42.5,
-      "clip_url": "/clips/forestfire_3/forestfire_3_000_0-6.mp4",
-      "distance": 0.123, "rrf_score": 0.030,
-      "summary": "森林大火燃烧, 浓烟滚滚",
-      "objects": "火焰、树木", "actions": "燃烧、蔓延", "scene": "森林",
-      "ocr": "iStock, by Getty Images", "asr": ""
+      "id": "clip_a1b2c3",
+      "video": "office_tour_02",
+      "start": 12.0, "end": 18.0,
+      "clip_url": "/clips/office_tour_02/office_tour_02_000_12-18.mp4",
+      "summary": "A man walks down the corridor carrying a stack of documents",
+      "objects": "man, documents, door", "actions": "walking, carrying",
+      "scene": "office corridor",
+      "ocr": "Conference Room B",
+      "asr": "I'll grab the reports and meet you inside."
     }
   ]
 }
 ```
 
-`clip_url` 即切好的视频片段, 可直接播放/下载 (物理文件在 `clips/`)。
+**Answer:**
+> Before opening the door, the man walked down the office corridor carrying a stack of documents and said he would grab the reports and meet the other person inside. [Clip 1]
 
-## 配置 (config.yaml)
+## 📁 Project Structure
 
-| 参数 | 默认 | 说明 |
-|---|---|---|
-| index.seg_len / overlap | 6.0 / 1.5 | 切片长度与重叠(秒) |
-| index.frames_per_clip | 8 | 每片段 embedding 抽帧数 |
-| server.default_top_k / max_top_k | 4 / 8 | 返回片段数范围 |
-| server.vlm_max_pixels | 245760 | 送 VLM 每帧最大像素 (控 token/显存) |
-| server.hybrid | true | 混合检索开关 |
-| server.text_weights | caption 1.0 / summary 0.8 / asr 0.8 | 文本路各类型权重 |
-| enrich.asr_model / asr_device | large-v3-turbo / cuda:2 | ASR 模型与卡位 |
-| vllm.enabled / max_model_len | true / 8192 | vLLM 开关与上下文长度 (须与 run_vllm.sh 一致) |
-
-## 检索原理
-
-1. **切片**: 视频按 6s 窗口 (1.5s 重叠) 切成片段 mp4, 短视频 (≤6s) 整体成段
-2. **视频向量**: 每片段抽 8 帧, Qwen3-VL-Embedding-8B 按官方 chat-template + lasttoken 池化 + L2 归一化 → 4096 维
-3. **文本向量**: 每片段最多 3 条文本 (摘要/结构化描述/语音) 用同模型文本侧打向量, 独立 collection
-4. **混合检索**: 视频路 + 文本路分别召回, 文本路按片段分组取最优 (乘类型权重), RRF 融合排序
-5. **作答**: top-k 片段抽帧送 Qwen3-VL-8B-Instruct, 要求只依据片段内容作答并标注 [片段N]
-
-## 常用运维
-
-```bash
-bash stop_server.sh / stop_vllm.sh      # 停服务
-bash run_index.sh --force               # 重建全部索引
-python tools/cleanup_video.py 文件名     # 删除视频+切片+向量
-python tools/backfill_enrich.py          # 给已入库片段回填文本增强 (幂等, 支持 --asr-only)
-tail -f logs/server.log logs/vllm.log   # 看日志
+```
+video-corpus-rag/
+├── src/                     # core library
+│   ├── server.py            # FastAPI app: /ask, /upload, /transcribe, /health
+│   ├── index.py             # slicing (fixed/adaptive), embedding, indexing pipeline
+│   ├── embedder.py          # Qwen3-VL-Embedding-8B wrapper (last-token pooling + L2)
+│   ├── enrich.py            # structured captioning, frame sampling, ASR transcriber
+│   ├── summarizer.py        # local fallback VLM summarizer
+│   ├── common.py            # config loading, path handling
+│   └── webui.html           # chat web UI (timeline, voice input, upload)
+├── tools/                   # maintenance scripts
+│   ├── backfill_enrich.py   # backfill text-side enrichment for existing clips
+│   ├── cleanup_video.py     # delete a video + its clips + vectors
+│   └── asktest.py           # CLI quick query
+├── examples/                # usage walkthroughs
+├── docs/overview.md         # technical overview: why & how Video RAG works
+├── config.yaml              # all tunables (indexing, retrieval, enrichment, vLLM)
+├── run_index.sh / run_server.sh / run_vllm.sh (+ run_vllm32.sh)   # launchers
+├── Dockerfile / docker-compose.yml / Dockerfile.vllm              # container packaging
+├── setup.sh / download_models.sh / requirements*.txt              # env & models
+└── CONTRIBUTING.md
 ```
 
-## 硬件实测
+## ⚙️ Configuration
 
-4 × RTX 3090 (24GB): 37 个视频 / 136 个 6s 片段, 单次问答 **3~5 秒**, 三路文本增强全部在线。
+Key options in `config.yaml` (full file is commented):
 
-## 常见问题
+| Option | Default | Description |
+|---|---|---|
+| `index.seg_len / overlap` | `6.0 / 1.5` | clip length and overlap (seconds) |
+| `index.adaptive` | `false` | shot-boundary adaptive slicing (PySceneDetect) |
+| `index.frames_per_clip` | `8` | frames sampled per clip for embedding |
+| `server.default_top_k / max_top_k` | `4 / 8` | number of returned clips |
+| `server.query_rewrite / merge_overlap / conversation` | `true / 0.5 / true` | query expansion, clip merging, multi-turn chat |
+| `server.hybrid` | `true` | hybrid video+text retrieval switch |
+| `server.text_weights` | `caption 1.0 / summary 0.8 / asr 0.8` | per-type text weights |
+| `enrich.asr_model / asr_device` | `large-v3-turbo / cuda:2` | ASR model and GPU |
+| `reranker.enabled` | `false` | enable Qwen3-Reranker-8B precision reranking |
+| `vllm.enabled / max_model_len` | `true / 8192` | vLLM switch and context length (must match `run_vllm.sh`) |
 
-- **服务启动慢**: 首次加载 embedding 模型约 1-2 分钟, `tail -f logs/server.log`
-- **/ask 报 token 超限 (400)**: 调低 top_k, 或同步调大 `run_vllm.sh --max-model-len` 与 `config.yaml vllm.max_model_len`
-- **vLLM 起不来**: 看 `logs/vllm.log`; 显存不足时调低 `--gpu-memory-utilization`
-- **没有 GPU 2 号卡**: 把 `enrich.asr_device` 改到空闲卡, 或 `enrich.asr_enabled: false`
-- **换更大模型**: 换成 `Qwen/Qwen3-VL-32B-Instruct` (~65GB, 需多卡 tensor parallel), 改 config 的 `vlm_model_id` 与 run_vllm.sh 参数
+## 🧠 Retrieval Pipeline
 
-## 许可
+1. **Slicing** — videos are cut into 6 s windows with 1.5 s overlap (or shot-aligned segments in adaptive mode)
+2. **Video vectors** — 8 frames per clip → Qwen3-VL-Embedding-8B (chat template, last-token pooling, L2) → 4096-dim vectors
+3. **Text vectors** — up to 3 texts per clip (summary / structured caption with OCR / ASR transcript) embedded by the same model into a separate Chroma collection
+4. **Hybrid retrieval** — video and text paths recall candidates; text hits are grouped per clip (best similarity × type weight); RRF fuses the two rankings
+5. **Query rewriting** — the question is expanded into several synonymous phrases, each retrieved and accumulated in the same RRF pool
+6. **Merging & reranking** — heavily overlapping clips from the same video are merged and re-cut; optional Qwen3-Reranker-8B re-scores the candidates
+7. **Answering** — top-k clips are sampled into frames and sent to Qwen3-VL-8B-Instruct (vLLM), which must answer only from the clips and cite `[Clip N]`
 
-本项目代码使用 [Apache License 2.0](LICENSE)。所依赖的模型 (Qwen3-VL 系列) 亦为 Apache-2.0。
+## 📡 HTTP API
 
-## 致谢
+| Endpoint | Method | Description |
+|---|---|---|
+| `/ask` | POST | query the corpus, returns answer + retrieved clips with times and metadata |
+| `/upload` | POST | upload a video; auto slice/embed/enrich; returns `job_id` |
+| `/jobs/{id}` | GET | indexing progress |
+| `/transcribe` | POST | audio file → text (powers the web UI's voice input) |
+| `/health` | GET | service status and vector counts per type |
+| `/clips/...` | GET | playable clip files |
 
-- [Qwen3-VL](https://github.com/QwenLM/Qwen3-VL) — 视觉语言模型 (Embedding / Instruct)
-- [Chroma](https://github.com/chroma-core/chroma) — 向量数据库
-- [vLLM](https://github.com/vllm-project/vllm) — 高性能推理引擎
-- [faster-whisper](https://github.com/SYSTRAN/faster-whisper) — 语音转写
+## 🐳 Docker
+
+```bash
+docker compose up -d server        # app service
+docker compose up -d vllm          # vLLM inference service (build from Dockerfile.vllm)
+```
+
+## 🛠️ Operations
+
+```bash
+bash stop_server.sh / stop_vllm.sh     # stop services
+bash run_index.sh --force              # rebuild the whole index
+python tools/cleanup_video.py <name>   # delete a video + clips + vectors
+python tools/backfill_enrich.py        # backfill text enrichment (idempotent, --asr-only)
+tail -f logs/server.log logs/vllm.log  # logs
+```
+
+## 📊 Performance
+
+Tested on 4 × RTX 3090 (24 GB): 37 videos / 136 six-second clips, one query answered in **3–5 s** with all three text-enrichment paths (caption / OCR / ASR) online.
+
+## ❓ FAQ
+
+- **Slow first start** — the embedding model takes 1–2 min to load; watch `logs/server.log`
+- **400 "decoder prompt too long"** — lower `top_k`, or raise both `run_vllm.sh --max-model-len` and `config.yaml vllm.max_model_len` together
+- **vLLM won't start** — see `logs/vllm.log`; lower `--gpu-memory-utilization` if VRAM is short. If you hit cache-block errors, set `longest_edge` in the model's `preprocessor_config.json` from `16777216` to `245760`
+- **No second GPU for ASR** — set `enrich.asr_device` to a free card or `enrich.asr_enabled: false`
+- **Upgrade to 32B** — `bash run_vllm32.sh` serves a bitsandbytes 4-bit Qwen3-VL-32B on port 8901; point `config.yaml vllm.base_url` at it
+
+## 🗺️ Roadmap
+
+- [ ] **Video Agent Memory** — persistent, queryable memory for embodied/video agents
+- [ ] **Long Video Understanding** — hierarchical indexing: shot → scene → video summarization
+- [ ] **Multimodal Knowledge Graph** — entity/relation extraction across the corpus
+- [ ] **VLA Memory** — vision-language-action memory module for robotics pipelines
+
+## 📚 Citation
+
+A technical report is in preparation. If you use this project in your research, please cite the repository for now:
+
+```bibtex
+@software{video_corpus_rag,
+  title        = {Video Corpus RAG: A Multimodal Video Retrieval-Augmented Generation
+                  Framework for Long Video Understanding},
+  author       = {bge3867-ai},
+  year         = {2026},
+  url          = {https://github.com/bge3867-ai/video-corpus-rag},
+  note         = {Apache-2.0 licensed open-source software}
+}
+```
+
+## 🤝 Contributing
+
+Issues, feature requests and pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## 🙏 Acknowledgments
+
+- [Qwen3-VL](https://github.com/QwenLM/Qwen3-VL) — vision-language models (embedding + instruct)
+- [Qwen3-Reranker](https://huggingface.co/Qwen/Qwen3-Reranker-8B) — precision reranking
+- [Chroma](https://github.com/chroma-core/chroma) — vector database
+- [vLLM](https://github.com/vllm-project/vllm) — high-performance inference engine
+- [faster-whisper](https://github.com/SYSTRAN/faster-whisper) — speech transcription
+- [PySceneDetect](https://github.com/Breakthrough/PySceneDetect) — scene-boundary detection
+
+## 📄 License
+
+This project is licensed under the [Apache License 2.0](LICENSE). The models it depends on (Qwen3-VL family) are also Apache-2.0.

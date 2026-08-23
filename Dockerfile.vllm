@@ -1,0 +1,5 @@
+# vLLM 推理服务镜像 (官方镜像自带全部 CUDA 依赖)
+FROM vllm/vllm-openai:v0.11.2
+
+# 模型通过 compose 的 volumes 挂载进 /models
+ENTRYPOINT ["python3", "-m", "vllm.entrypoints.openai.api_server"]

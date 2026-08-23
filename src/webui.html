@@ -18,8 +18,15 @@
   input[type=text]:focus { border-color:#4f7cf7; }
   button { padding:12px 22px; font-size:15px; border:0; border-radius:10px;
     background:#4f7cf7; color:#fff; cursor:pointer; }
+  button.mini { padding:12px 14px; font-size:15px; background:#2b3446; }
+  button.mini.on { background:#e05252; }
   button:disabled { background:#33415e; cursor:wait; }
   .row { display:flex; align-items:center; gap:10px; margin-top:12px; color:#8b93a5; font-size:13px; }
+  .chat { margin-top:20px; display:grid; gap:14px; }
+  .msg { background:#151a24; border:1px solid #232a38; border-radius:12px; padding:14px 18px; }
+  .msg .q { color:#7ba1ff; font-weight:600; margin-bottom:6px; }
+  .msg .q::before { content:"🙋 "; }
+  .msg .a { line-height:1.7; white-space:pre-wrap; }
   .answer { margin-top:20px; background:#151a24; border:1px solid #232a38;
     border-radius:12px; padding:16px 20px; line-height:1.7; white-space:pre-wrap; }
   .answer .h { color:#4f7cf7; font-weight:600; margin-bottom:8px; }
@@ -37,6 +44,12 @@
   .clip .ocr::before { content:"🔤 画面文字: "; color:#4f7cf7; font-weight:600; }
   .clip .asr { margin-top:6px; color:#c9d2e3; line-height:1.6; }
   .clip .asr::before { content:"🔊 语音文本: "; color:#4f7cf7; font-weight:600; }
+  .clip .tag { color:#4f7cf7; border:1px solid #33415e; border-radius:4px;
+    padding:0 6px; font-size:12px; margin-left:6px; }
+  .tl { margin-top:8px; position:relative; height:8px; background:#232a38;
+    border-radius:4px; }
+  .tl .hit { position:absolute; top:0; bottom:0; background:#4f7cf7; border-radius:4px; }
+  .tl .lab { position:absolute; top:-16px; font-size:11px; color:#8b93a5; }
   .err { color:#ff7a7a; margin-top:12px; }
   a { color:#7ba1ff; text-decoration:none; }
 </style>
@@ -49,6 +62,7 @@
 <div class="wrap">
   <div class="search">
     <input id="q" type="text" placeholder="问视频库里的内容, 例如: 有没有森林着火的画面?" />
+    <button id="mic" class="mini" title="语音输入" onclick="mic()">🎤</button>
     <button id="btn" onclick="ask()">提问</button>
   </div>
   <div class="row">
@@ -56,7 +70,8 @@
     <select id="k">
       <option>2</option><option selected>4</option><option>6</option><option>8</option>
     </select>
-    <span id="stat" style="margin-left:auto"></span>
+    <button class="mini" onclick="clearChat()" style="margin-left:auto">清空对话</button>
+    <span id="stat"></span>
   </div>
   <div class="row">
     <label>上传视频入库</label>
@@ -66,19 +81,97 @@
     <span id="upstat"></span>
   </div>
   <div id="err" class="err"></div>
-  <div id="answer" class="answer" style="display:none">
-    <div class="h">💬 基于命中片段的回答</div>
-    <div id="answerText"></div>
-  </div>
+  <div id="chat" class="chat"></div>
   <div id="clips" class="clips"></div>
 </div>
 <script>
+let history = [];
+let lastClipPaths = [];
 function refreshStat(){
   fetch('/health').then(r=>r.json()).then(d=>{
     document.getElementById('stat').textContent = '已入库片段: ' + d.clips_in_index;
   });
 }
 refreshStat();
+function clipCard(c,i){
+  const tl = c.video_duration ? `
+    <div class="tl" title="原视频时间轴, 蓝色为命中区间">
+      <span class="lab" style="left:0">0s</span>
+      <span class="lab" style="right:0">${c.video_duration}s</span>
+      <div class="hit" style="left:${(c.start/c.video_duration*100).toFixed(1)}%;width:${((c.end-c.start)/c.video_duration*100).toFixed(1)}%"></div>
+    </div>` : '';
+  return `
+  <div class="clip">
+    <video controls preload="metadata" src="${c.clip_url}"></video>
+    <div class="meta"><b>片段${i+1}</b> · 视频 <b>${c.video}</b> ·
+    切片 ${c.start}s ~ ${c.end}s${c.video_duration ? ` · 原视频全片 ${c.video_duration}s` : ''} ·
+    相似度 ${(1-(c.distance??0)).toFixed(3)} · <a href="${c.clip_url}" download>下载</a>
+    ${c.merged ? '<span class="tag">已合并重叠片段</span>' : ''}
+    ${tl}
+    ${c.summary ? `<div class="summ">${c.summary}</div>` : ''}
+    ${(c.objects||c.actions||c.scene) ? `<div class="cap">${[['对象',c.objects],['动作',c.actions],['场景',c.scene]].filter(x=>x[1]).map(x=>`<b>${x[0]}</b>: ${x[1]}`).join(' · ')}</div>` : ''}
+    ${c.ocr ? `<div class="ocr">${c.ocr}</div>` : ''}
+    ${c.asr ? `<div class="asr">${c.asr}</div>` : ''}
+    </div>
+  </div>`;
+}
+function ask(){
+  const q = document.getElementById('q').value.trim();
+  const err = document.getElementById('err');
+  err.textContent='';
+  if(!q){ err.textContent='请输入问题'; return; }
+  const btn = document.getElementById('btn');
+  btn.disabled = true; btn.textContent = '检索中...';
+  fetch('/ask', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({question:q, top_k:+document.getElementById('k').value, history:history, last_clips:lastClipPaths})})
+  .then(r=>r.json()).then(d=>{
+    if(d.error){ err.textContent=d.error; return; }
+    history.push({question:d.question, answer:d.answer});
+    lastClipPaths = d.clips.map(c=>c.clip_path);
+    renderChat();
+    const box = document.getElementById('clips');
+    box.innerHTML = d.clips.map(clipCard).join('');
+    document.getElementById('q').value='';
+  }).catch(e=>err.textContent='请求失败: '+e)
+  .finally(()=>{ btn.disabled=false; btn.textContent='提问'; });
+}
+function renderChat(){
+  const box = document.getElementById('chat');
+  box.innerHTML = history.map(m=>`
+    <div class="msg">
+      <div class="q">${m.question}</div>
+      ${m.answer ? `<div class="a">${m.answer}</div>` : ''}
+    </div>`).join('');
+}
+function clearChat(){ history = []; lastClipPaths = []; renderChat(); document.getElementById('clips').innerHTML=''; }
+let recorder=null;
+async function mic(){
+  const btn = document.getElementById('mic');
+  const err = document.getElementById('err');
+  if(recorder){ recorder.stop(); recorder=null; btn.classList.remove('on'); return; }
+  try{
+    const stream = await navigator.mediaDevices.getUserMedia({audio:true});
+    recorder = new MediaRecorder(stream);
+    const chunks = [];
+    recorder.ondataavailable = e=>chunks.push(e.data);
+    recorder.onstop = async ()=>{
+      stream.getTracks().forEach(t=>t.stop());
+      const blob = new Blob(chunks,{type:recorder.mimeType||'audio/webm'});
+      const fd = new FormData();
+      fd.append('file', blob, 'voice.webm');
+      btn.textContent='...';
+      try{
+        const r = await fetch('/transcribe',{method:'POST',body:fd});
+        const d = await r.json();
+        if(d.text){ document.getElementById('q').value=d.text; err.textContent='语音识别完成, 点击提问或回车'; }
+        else err.textContent='没听清, 请再说一次或直接打字';
+      }catch(e){ err.textContent='语音识别失败: '+e; }
+      btn.textContent='🎤';
+    };
+    recorder.start();
+    btn.classList.add('on'); btn.textContent='⏹';
+  }catch(e){ err.textContent='无法使用麦克风: '+e; }
+}
 async function upload(){
   const f = document.getElementById('file').files[0];
   const st = document.getElementById('upstat');
@@ -108,36 +201,6 @@ function pollJob(id){
       refreshStat();
     }catch(e){ /* 轮询失败忽略, 下轮再试 */ }
   }, 3000);
-}
-function ask(){
-  const q = document.getElementById('q').value.trim();
-  const err = document.getElementById('err');
-  err.textContent='';
-  if(!q){ err.textContent='请输入问题'; return; }
-  const btn = document.getElementById('btn');
-  btn.disabled = true; btn.textContent = '检索中...';
-  fetch('/ask', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({question:q, top_k:+document.getElementById('k').value})})
-  .then(r=>r.json()).then(d=>{
-    if(d.error){ err.textContent=d.error; return; }
-    const a = document.getElementById('answer');
-    if(d.answer){ a.style.display='block'; document.getElementById('answerText').textContent=d.answer; }
-    else { a.style.display='none'; }
-    const box = document.getElementById('clips');
-    box.innerHTML = d.clips.map((c,i)=>`
-      <div class="clip">
-        <video controls preload="metadata" src="${c.clip_url}"></video>
-        <div class="meta"><b>片段${i+1}</b> · 视频 <b>${c.video}</b> ·
-        切片 ${c.start}s ~ ${c.end}s${c.video_duration ? ` · 原视频全片 ${c.video_duration}s` : ''} ·
-        相似度 ${(1-(c.distance??0)).toFixed(3)} · <a href="${c.clip_url}" download>下载</a>
-        ${c.summary ? `<div class="summ">${c.summary}</div>` : ''}
-        ${(c.objects||c.actions||c.scene) ? `<div class="cap">${[['对象',c.objects],['动作',c.actions],['场景',c.scene]].filter(x=>x[1]).map(x=>`<b>${x[0]}</b>: ${x[1]}`).join(' · ')}</div>` : ''}
-        ${c.ocr ? `<div class="ocr">${c.ocr}</div>` : ''}
-        ${c.asr ? `<div class="asr">${c.asr}</div>` : ''}
-        </div>
-      </div>`).join('');
-  }).catch(e=>err.textContent='请求失败: '+e)
-  .finally(()=>{ btn.disabled=false; btn.textContent='提问'; });
 }
 document.getElementById('q').addEventListener('keydown', e=>{ if(e.key==='Enter') ask(); });
 </script>

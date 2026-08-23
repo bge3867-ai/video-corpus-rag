@@ -1,0 +1,9 @@
+models/
+videos/
+clips/
+chroma_db/
+logs/
+.git/
+__pycache__/
+*.pyc
+.DS_Store

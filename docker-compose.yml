@@ -1,0 +1,62 @@
+# 单机一键部署: docker compose up -d
+# 前提: NVIDIA 驱动 + nvidia-container-toolkit
+#
+# 注意:
+# 1. 首次运行前把模型放进 ./models (bash download_models.sh)
+# 2. app 容器内 config.yaml 的 vllm.base_url 要指向 vllm 服务:
+#      base_url: "http://vllm:8900/v1"
+# 3. 多卡宿主机的卡位分配见 deploy.resources 的 device_ids,
+#    按需与 config.yaml 里的 embed_device / asr_device / reranker.device 对齐
+services:
+  app:
+    build: .
+    container_name: videosrag-app
+    ports:
+      - "8899:8899"
+    volumes:
+      - ./models:/models
+      - ./videos:/app/videos
+      - ./clips:/app/clips
+      - ./chroma_db:/app/chroma_db
+      - ./logs:/app/logs
+    environment:
+      - HF_ENDPOINT=https://hf-mirror.com
+    depends_on:
+      - vllm
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0", "2", "3"]
+              capabilities: [gpu]
+
+  vllm:
+    build:
+      dockerfile: Dockerfile.vllm
+    container_name: videosrag-vllm
+    ports:
+      - "8900:8900"
+    volumes:
+      - ./models:/models
+    command: [
+      "--model", "/models/Qwen3-VL-8B-Instruct",
+      "--served-model-name", "Qwen3-VL-8B-Instruct",
+      "--host", "0.0.0.0", "--port", "8900",
+      "--dtype", "bfloat16",
+      "--gpu-memory-utilization", "0.95",
+      "--max-model-len", "8192",
+      "--max-num-seqs", "8",
+      "--max-num-batched-tokens", "1024",
+      "--limit-mm-per-prompt", '{"video": 10, "image": 40}',
+      "--mm-processor-kwargs", '{"max_pixels": 245760}'
+    ]
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]
+              capabilities: [gpu]

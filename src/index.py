@@ -63,6 +63,59 @@ def make_segments(dur: float, seg_len: float, overlap: float, short_limit: float
     return segs
 
 
+def make_segments_adaptive(vpath: str, dur: float, cfg):
+    """按镜头/场景边界自适应切片 (PySceneDetect)。
+
+    规则: 过短的场景并入相邻场景; 长场景按 seg_max 窗口切 (seg_max 内小重叠);
+    失败时回退固定窗口切片。
+    """
+    idx = cfg["index"]
+    seg_min = idx.get("seg_min", 4.0)
+    seg_max = idx.get("seg_max", 12.0)
+    overlap = idx.get("overlap", 1.5)
+    try:
+        from scenedetect import ContentDetector, SceneManager, open_video
+
+        sm = SceneManager()
+        sm.add_detector(ContentDetector(threshold=27.0))
+        sm.detect_scenes(open_video(str(vpath)))
+        scenes = [(s.get_seconds(), e.get_seconds())
+                  for s, e in sm.get_scene_list()]
+    except Exception as exc:  # noqa: BLE001 场景检测失败回退固定切片
+        log.warning("场景检测失败(%s), 回退固定切片: %s", exc, vpath)
+        return make_segments(dur, idx["seg_len"], overlap, idx["short_limit"])
+    if not scenes:
+        return make_segments(dur, idx["seg_len"], overlap, idx["short_limit"])
+
+    # 1) 短场景并入相邻场景 (或推迟到有足够长度的位置)
+    merged = []
+    for s, e in scenes:
+        if merged and s - merged[-1][1] < seg_min:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        elif e - s < seg_min:
+            if merged:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+            else:
+                merged.append((s, e))
+        else:
+            merged.append((s, e))
+
+    # 2) 长场景切成 seg_max 窗口
+    segs = []
+    for s, e in merged:
+        if e - s <= seg_max:
+            segs.append((round(s, 2), round(e, 2)))
+            continue
+        t = s
+        while t < e:
+            end = min(t + seg_max, e)
+            segs.append((round(t, 2), round(end, 2)))
+            if end >= e:
+                break
+            t = max(end - overlap, s)
+    return segs
+
+
 def cut_clip(src_path: str, start: float, end: float, out_path: str, has_audio: bool, crf: int):
     """用 ffmpeg 精确切出 start~end 片段并重编码为 mp4。"""
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -113,8 +166,12 @@ def process_video(vpath, cfg, col, text_col, embedder,
         return 0, True
 
     dur, audio = probed(vpath)
-    segs = make_segments(dur, idx["seg_len"], idx["overlap"], idx["short_limit"])
-    log.info("处理 %s (%.1fs, %d 个片段)", name, dur, len(segs))
+    if idx.get("adaptive"):
+        segs = make_segments_adaptive(vpath, dur, cfg)
+    else:
+        segs = make_segments(dur, idx["seg_len"], idx["overlap"], idx["short_limit"])
+    log.info("处理 %s (%.1fs, %d 个片段%s)", name, dur, len(segs),
+             ", 自适应" if idx.get("adaptive") else "")
 
     stem = os.path.splitext(name)[0]
     cd = cfg["paths"]["clips"]

@@ -13,6 +13,8 @@ import itertools
 import logging
 import os
 import queue
+import re
+import tempfile
 import threading
 
 import chromadb
@@ -25,7 +27,7 @@ from pydantic import BaseModel
 from common import load_cfg, model_local_path
 from embedder import Embedder
 from enrich import ASRTranscriber, CAPTION_PROMPT, frame_parts, parse_caption
-from index import process_video
+from index import cut_clip, probed, process_video
 
 log = logging.getLogger("videosrag.server")
 
@@ -82,6 +84,8 @@ class AskReq(BaseModel):
     question: str
     top_k: int = cfg["server"]["default_top_k"]
     with_answer: bool = True
+    history: list = []  # 多轮对话历史: [{"question": "...", "answer": "..."}, ...]
+    last_clips: list = []  # 上一轮返回片段的 clip_path 列表 (追问时排最前)
 
 
 def _mm_kwargs():
@@ -211,9 +215,194 @@ def hybrid_search(qvec, top_k):
     return [(cid, vmetas[cid], score, vdists.get(cid)) for cid, score in order]
 
 
-def build_vlm_messages(question: str, clip_paths):
-    """把命中的视频片段组织成 VLM 输入 (vLLM 抽帧图片 / transformers 视频 两种格式)。"""
+REWRITE_PROMPT = (
+    "把下面的视频检索问题改写成 2 个语义等价的简短检索短语 (每个不超过15字), "
+    "每行一个, 直接输出短语本身, 不要序号和任何解释。\n问题: {q}"
+)
+
+
+def rewrite_query(q: str):
+    """用 VLM 把问题扩展成多个同义检索短语 (原始问题排第一)。"""
+    if not vllm_client or not cfg["server"].get("query_rewrite", True):
+        return [q]
+    try:
+        text = _generate(
+            [{"role": "user", "content": REWRITE_PROMPT.format(q=q)}], 64
+        )
+        out = [q]
+        for line in text.splitlines():
+            p = line.strip().lstrip("-*#0123456789.、 ").strip()
+            if p and p != q and p not in out:
+                out.append(p)
+        return out[:3]
+    except Exception as exc:  # noqa: BLE001 改写失败退回原问题
+        log.warning("查询改写失败, 使用原问题: %s", exc)
+        return [q]
+
+
+def search_with_rewrites(q: str, n: int):
+    """多短语分路检索, 跨短语累加 RRF 分数。
+
+    返回 [(cid, meta, rrf_score, distance)] 按分数降序, 最多 n 个。
+    """
+    srv = cfg["server"]
+    phrases = rewrite_query(q)
+    acc, metas, dists = {}, {}, {}
+    for pi, p in enumerate(phrases):
+        w = 1.0 if pi == 0 else srv.get("rewrite_w", 0.6)
+        qvec = embedder.encode_query(p)
+        for cid, m, score, d in hybrid_search(qvec, max(n, 4)):
+            acc[cid] = acc.get(cid, 0.0) + score * w
+            metas[cid] = m
+            dists[cid] = d
+    order = sorted(acc.items(), key=lambda kv: kv[1], reverse=True)[:n]
+    return [(cid, metas[cid], score, dists.get(cid)) for cid, score in order]
+
+
+def merge_clips(hits):
+    """同视频的重叠片段合并: 跨段重切成一个连续片段, 返回合并后的 hits。
+
+    片段按分数降序, 每个新片段与已保留片段的重叠比例超过
+    server.merge_overlap 时, 与其中分数更高者合并为并集区间。
+    """
+    thr = cfg["server"].get("merge_overlap", 0.5)
+    if not thr:
+        return hits
+    kept = []  # [(cid, meta, rrf, dist)]
+    for cid, m, score, d in hits:
+        if not m.get("clip_path"):
+            continue
+        merged = None
+        for i, (k0, m0, s0, d0) in enumerate(kept):
+            if m0.get("video") != m.get("video"):
+                continue
+            s0, e0 = m0["start"], m0["end"]
+            s1, e1 = m["start"], m["end"]
+            ov = min(e0, e1) - max(s0, s1)
+            # 重叠占较短片段的比例超过阈值才合并
+            if ov > 0 and ov / min(e0 - s0, e1 - s1) >= thr:
+                merged = i
+                break
+        if merged is None:
+            kept.append([cid, m, score, d])
+            continue
+        # 与 kept[merged] 合并成并集区间, 取两段中分数更高的元数据
+        k0, m0, s0, d0 = kept[merged]
+        if s0 < score:
+            m0, s0, d0 = m, score, d if d is not None else d0
+        nu, ne = min(m0["start"], m["start"]), max(m0["end"], m["end"])
+        m0 = dict(m0)
+        m0["start"], m0["end"] = nu, ne
+        m0["merged"] = True
+        kept[merged] = [k0, m0, s0, min(d0, d) if d is not None else d0]
+    # 合并后的片段跨段重切真实视频文件 (缓存)
+    out = []
+    for cid, m, score, d in kept:
+        try:
+            src = m.get("video_path")
+            if src and os.path.isfile(src) and m.get("merged"):
+                has_audio, _ = probed(src)
+                stem = os.path.splitext(os.path.basename(src))[0]
+                rel = os.path.join("_merged", f"{stem}_{int(m['start'])}-{int(m['end'])}.mp4")
+                abs_out = os.path.join(cfg["paths"]["clips"], rel)
+                if not os.path.exists(abs_out):
+                    os.makedirs(os.path.dirname(abs_out), exist_ok=True)
+                    cut_clip(src, m["start"], m["end"], abs_out, has_audio,
+                             cfg["index"]["clip_crf"])
+                m["clip_path"] = rel
+                m["clip_url"] = "/clips/" + rel
+        except Exception as exc:  # noqa: BLE001 合并重切失败退回原片段
+            log.warning("合并重切失败, 使用原片段: %s", exc)
+        out.append((cid, m, score, d))
+    return out
+
+
+# ---- Reranker 候选精排 (Qwen3-Reranker, 懒加载) ----
+_reranker = None
+_reranker_lock = threading.Lock()
+
+
+def _get_reranker():
+    global _reranker
+    rcfg = cfg.get("reranker") or {}
+    if not rcfg.get("enabled") or not rcfg.get("model_id"):
+        return None
+    with _reranker_lock:
+        if _reranker is None:
+            from transformers import (  # noqa: E402 懒加载
+                AutoModelForSequenceClassification,
+                AutoTokenizer,
+            )
+
+            path = model_local_path(cfg, rcfg["model_id"])
+            log.info("加载 reranker %s (device=%s) ...", path, rcfg.get("device"))
+            tok = AutoTokenizer.from_pretrained(path)
+            mdl = AutoModelForSequenceClassification.from_pretrained(
+                path,
+                device_map=rcfg.get("device", "cuda:3"),
+                torch_dtype=torch.bfloat16,
+            ).eval()
+            _reranker = (tok, mdl)
+            log.info("reranker 加载完成")
+    return _reranker
+
+
+def rerank_clips(q: str, clips):
+    """用 reranker 对候选片段打分重排, 返回重排后的列表。"""
+    r = _get_reranker()
+    if r is None:
+        return clips
+    tok, mdl = r
+
+    def doc_text(m):
+        parts = [m.get("summary", ""), m.get("objects", ""), m.get("actions", ""),
+                 m.get("scene", ""), m.get("ocr", ""), m.get("asr", "")]
+        return " ".join(p for p in parts if p)[:300] or m.get("video", "")
+
+    scores = []
+    for _, m, _, _ in clips:
+        msgs = [{
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "text": (
+                    "<instruct>Given a query A and a passage B, determine whether "
+                    "the passage contains an answer to the query by providing a "
+                    "prediction of either 'Yes' or 'No'.\n"
+                    f"<query>{q}</query>\n<passage>{doc_text(m)}</passage>"
+                ),
+            }],
+        }]
+        inputs = tok.apply_chat_template(
+            msgs, tokenize=True, add_generation_prompt=False, return_tensors="pt"
+        ).to(mdl.device)
+        with torch.no_grad():
+            logits = mdl(inputs).logits[0][-1]
+        scores.append(float(torch.sigmoid(logits).cpu()))
+    order = sorted(range(len(clips)), key=lambda i: scores[i], reverse=True)
+    return [clips[i] for i in order]
+
+
+def build_vlm_messages(question: str, clip_paths, history=None, clip_texts=None):
+    """把命中的视频片段组织成 VLM 输入 (vLLM 抽帧图片 / transformers 视频 两种格式)。
+
+    history: 多轮对话历史; clip_texts: 上一轮返回片段的文本描述, 供追问引用。
+    """
     content = []
+    if cfg["server"].get("conversation", True) and (history or clip_texts):
+        ctx = ["(这是多轮对话, 请结合上下文回答当前问题)"]
+        for h in (history or [])[-3:]:
+            q, a = (h.get("question", "") if isinstance(h, dict) else ""), \
+                   (h.get("answer", "") if isinstance(h, dict) else "")
+            if q:
+                ctx.append(f"此前问题: {q}")
+            if a:
+                ctx.append(f"此前回答: {a[:200]}")
+        if clip_texts:
+            ctx.append("上一轮返回的片段信息(用户提到'第N个片段'时按此顺序对应):")
+            for i, t in enumerate(clip_texts, 1):
+                ctx.append(f"  片段{i}: {t[:150]}")
+        content.append({"type": "text", "text": "\n".join(ctx)})
     if vllm_client is not None:
         n = _vllm_frames_per_clip(max(len(clip_paths), 1))
         for i, p in enumerate(clip_paths, 1):
@@ -247,9 +436,37 @@ def ask(req: AskReq):
     if not q:
         return {"error": "问题不能为空"}
     top_k = max(1, min(req.top_k or cfg["server"]["default_top_k"], cfg["server"]["max_top_k"]))
-    qvec = embedder.encode_query(q)
 
-    hits = hybrid_search(qvec, top_k)
+    # 1) 检索 (查询改写 + 混合检索 + 相邻片段合并)
+    hits = search_with_rewrites(q, top_k * 2)
+
+    # 追问型问题 (引用上一轮片段): 上一轮片段排最前, 保证 [片段N] 编号一致
+    prev = []
+    if req.last_clips:
+        try:
+            rows = col.get(where={"clip_path": {"$in": list(req.last_clips)}},
+                           include=["metadatas"])
+            bypath = {m["clip_path"]: (cid, m)
+                      for cid, m in zip(rows["ids"], rows["metadatas"])}
+            for p in req.last_clips:
+                if p in bypath:
+                    cid, m = bypath[p]
+                    prev.append((cid, m, 1.0, None))
+        except Exception:  # noqa: BLE001
+            prev = []
+    is_followup = bool(prev) and re.search(
+        r"第[一二三四五六七八九十\d]+个|片段\s*\d+|刚才|其中|那个|这个|它", q)
+    if is_followup:
+        seen = {c[0] for c in prev}
+        hits = prev + merge_clips([h for h in hits if h[0] not in seen])
+    else:
+        hits = merge_clips(hits)
+    # 候选精排: 对前 N 个候选用 reranker 打分重排
+    if (cfg.get("reranker") or {}).get("enabled"):
+        n_cand = min(len(hits), (cfg.get("reranker") or {}).get("candidates", 20))
+        hits = rerank_clips(q, hits[:n_cand]) + hits[n_cand:]
+    hits = hits[:top_k]
+
     clips = []
     for cid, m, score, dist in hits:
         if not m.get("clip_path"):
@@ -271,17 +488,38 @@ def ask(req: AskReq):
             "scene": m.get("scene", ""),
             "ocr": m.get("ocr", ""),
             "asr": m.get("asr", ""),
+            "merged": bool(m.get("merged")),
             "_abs_path": abs_path,
         })
 
     answer = ""
     if req.with_answer and clips:
-        msgs = build_vlm_messages(q, [c["_abs_path"] for c in clips])
+        clip_texts = [
+            " | ".join(x for x in (c.get("summary"), c.get("objects"),
+                                   c.get("actions"), c.get("asr")) if x)
+            for c in clips
+        ]
+        msgs = build_vlm_messages(q, [c["_abs_path"] for c in clips],
+                                  history=req.history, clip_texts=clip_texts)
         answer = _generate(msgs, cfg["server"]["max_new_tokens"])
 
     for c in clips:
         c.pop("_abs_path", None)
     return {"question": q, "answer": answer, "clips": clips}
+
+
+@app.post("/transcribe")
+async def transcribe(file: UploadFile = File(...)):
+    """浏览器录制的语音 -> 文字 (语音提问用, 复用 faster-whisper)。"""
+    suffix = os.path.splitext(file.filename or "audio.webm")[1] or ".webm"
+    fd, tmp = tempfile.mkstemp(suffix=suffix)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            while chunk := await file.read(1 << 20):
+                f.write(chunk)
+        return {"text": transcribe_clip(tmp)}
+    finally:
+        os.unlink(tmp)
 
 
 # ---- 上传自动入库 (后台单队列, 避免 GPU 并发争抢) ----

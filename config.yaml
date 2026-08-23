@@ -27,6 +27,9 @@ index:
   frames_per_clip: 8               # 每个片段抽多少帧做 embedding
   video_exts: [".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv"]
   clip_crf: 23                    # 切片重编码质量 (越小越清晰)
+  adaptive: false                 # true: 按镜头/场景边界自适应切片 (重建索引生效)
+  seg_min: 4.0                    # 自适应切片最短片段(秒)
+  seg_max: 12.0                   # 自适应切片最长片段(秒)
 
 server:
   host: 0.0.0.0
@@ -44,6 +47,15 @@ server:
     caption: 1.0
     summary: 0.8
     asr: 0.8
+  query_rewrite: true             # 查询改写: 扩展为多个同义短语分路检索
+  merge_overlap: 0.5              # 同视频片段重叠超过该比例则合并为一个片段
+  conversation: true              # 多轮对话: 携带历史上下文回答追问
+
+reranker:                         # 候选精排 (Qwen3-Reranker, 可选)
+  enabled: false                  # true 时对 top-N 候选用重排模型打分
+  model_id: Qwen/Qwen3-Reranker-8B
+  device: "cuda:3"                # 按你的显卡调整卡号
+  candidates: 20                  # 进入精排的候选数
 
 enrich:                           # 片段文本侧增强
   caption_enabled: true           # 入库时生成结构化描述 (摘要/对象/动作/场景/画面文字)
